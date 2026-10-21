@@ -1,0 +1,94 @@
+# ==============================================================
+# Cf/SiC 复合材料 X 轴强制拉伸断裂模拟 (修复版)
+# ==============================================================
+
+# ----------------- 1. 初始化设置 -----------------
+units           real
+dimension       3
+boundary        m s s  
+atom_style      charge
+newton          on
+
+# ----------------- 2. 读入模型与力场 -----------------
+read_data       basal_plane.data
+
+# 强制扩大 X 轴盒子边界，为拉伸提供足够的空间
+change_box      all x final 0 40.0 units box
+
+mass            1 12.011  # C
+mass            2 28.085  # Si
+
+pair_style      reaxff NULL
+pair_coeff      * * ffield.reax.C_Si C Si
+
+fix             qeq all qeq/reaxff 1 0.0 10.0 1.0e-6 reaxff
+
+# ----------------- 3. 严格分组 -----------------
+region          r_left  block INF 2.0 INF INF INF INF
+group           left_pad  region r_left
+
+region          r_right block 14.5 17.5 INF INF INF INF
+group           right_pad region r_right
+
+group           boundary union left_pad right_pad
+group           mobile   subtract all boundary
+
+# ----------------- 4. 第一阶段：结构平衡 -----------------
+# [修正点] 在最小化前显式声明势能计算，防止 thermo 报错
+compute         my_pe_val all pe
+compute         my_ke_val all ke
+
+print           "=== 开始能量最小化 ==="
+fix             f_static boundary setforce 0.0 0.0 0.0
+minimize        1.0e-8 1.0e-10 1000 10000
+
+print           "=== 开始 NVT 恒温平衡 (2.5 ps) ==="
+timestep        0.25
+fix             f_nvt mobile nvt temp 300.0 300.0 100.0
+run             10000
+unfix           f_nvt
+reset_timestep  0
+
+# ----------------- 5. 第二阶段：强制拉伸与变量定义 -----------------
+print           "=== 开始强制拉伸：记录应力与能量数据 ==="
+
+# --- 定义计算变量 ---
+# 1. 计算右端受力 (用于应力计算)
+compute         f_pull_sum right_pad reduce sum fx
+
+# 2. 应力换算 (GPa)
+variable        stress_GPa equal (c_f_pull_sum*69.477)/(10.06*40.0)*0.01
+
+# 3. 能量变量 (通过 compute 引用，比直接用 pe 关键词更稳定)
+variable        out_pe     equal c_my_pe_val
+variable        out_ke     equal c_my_ke_val
+variable        out_etotal equal (c_my_pe_val+c_my_ke_val)
+
+# --- 拉伸控制 ---
+fix             f_lock_l left_pad setforce 0.0 0.0 0.0
+velocity        left_pad set 0.0 0.0 0.0
+
+# 强制右端匀速位移 (0.0002 A/fs = 20 m/s)
+fix             f_pull_r right_pad move linear 0.0002 0.0 0.0 units box
+
+# 中间区域控温
+fix             f_nvt_active mobile nvt temp 300.0 300.0 100.0
+
+# ----------------- 6. 最终数据输出 -----------------
+dump            d1 all custom 500 fracture_final.lammpstrj id type q x y z
+dump_modify     d1 sort id
+
+# 能量与应力数据文件 (每 1000 步保存一次)
+fix             f_out all ave/time 1 100 1000 v_stress_GPa v_out_pe v_out_ke v_out_etotal file stress_energy_results.txt
+
+# 屏幕实时显示
+thermo          1000
+# 注意：在 thermo_style 中直接使用 pe 以强制初始化
+thermo_style    custom step temp pe v_stress_GPa v_out_pe lx
+thermo_modify   lost ignore
+
+# ----------------- 7. 执行拉伸 -----------------
+# 200,000 步 = 50 ps
+run             400000
+
+print           "=== 模拟圆满完成！数据已保存至 stress_energy_results.txt ==="

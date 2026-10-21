@@ -1,0 +1,91 @@
+# ==============================================================
+# Cf/SiC 复合材料 (Edge Structure) X 轴强制拉伸最终修正版
+# ==============================================================
+
+# ----------------- 1. 初始化设置 -----------------
+units           real
+dimension       3
+# 初始定义为 p p p 以确保 read_data 顺利通过
+boundary        p p p  
+atom_style      charge
+newton          on
+
+# ----------------- 2. 读入模型与力场 -----------------
+# 注意：确保文件名与你本地文件一致
+read_data       edge_structure.data
+
+# 🎯 [核心修复] 使用 change_box 同时修改边界类型(boundary)和尺寸(final)
+# 将 x 轴改为 m (有限边界)，y z 改为 s (周期收缩性边界)
+# 同时将 x 轴范围扩大到 -10 到 60
+change_box      all x final -10.0 60.0 boundary m s s
+
+mass            1 12.011  # C
+mass            2 28.085  # Si
+
+# ReaxFF 反应力场设置
+pair_style      reaxff NULL
+pair_coeff      * * ffield.reax.C_Si C Si
+
+fix             qeq all qeq/reaxff 1 0.0 10.0 1.0e-6 reaxff
+
+# ----------------- 3. 极其严格的分组 (基于 Lx=12.33) -----------------
+# 左端固定端
+region          r_left  block -5.0 2.5 INF INF INF INF
+group           left_pad  region r_left
+
+# 右端拉伸端 (抓住原模型最右侧原子)
+region          r_right block 10.0 13.5 INF INF INF INF
+group           right_pad region r_right
+
+group           boundary union left_pad right_pad
+group           mobile   subtract all boundary
+
+# ----------------- 4. 第一阶段：结构平衡 -----------------
+compute         my_pe_val all pe
+compute         my_ke_val all ke
+
+print           "=== 开始能量最小化 ==="
+fix             f_static boundary setforce 0.0 0.0 0.0
+minimize        1.0e-8 1.0e-10 1000 10000
+
+print           "=== 开始 NVT 恒温平衡 (2.5 ps) ==="
+timestep        0.25
+fix             f_nvt mobile nvt temp 300.0 300.0 100.0
+run             10000
+unfix           f_nvt
+reset_timestep  0
+
+# ----------------- 5. 第二阶段：强制拉伸 -----------------
+print           "=== 开始强制拉伸 ==="
+
+compute         f_pull_sum right_pad reduce sum fx
+# 截面积使用报错信息中的 Ly*Lz (16.0 * 34.4)
+variable        stress_GPa equal (c_f_pull_sum*69.477)/(16.0*34.4)*0.01
+variable        out_pe     equal c_my_pe_val
+variable        out_ke     equal c_my_ke_val
+variable        out_etotal equal (c_my_pe_val+c_my_ke_val)
+
+# 锁定左端
+fix             f_lock_l left_pad setforce 0.0 0.0 0.0
+velocity        left_pad set 0.0 0.0 0.0
+
+# 强制右端以 20 m/s 速度拉伸
+fix             f_pull_r right_pad move linear 0.0002 0.0 0.0 units box
+fix             f_nvt_active mobile nvt temp 300.0 300.0 100.0
+
+# ----------------- 6. 数据输出 -----------------
+dump            d1 all custom 1000 edge_fracture.lammpstrj id type q x y z
+dump_modify     d1 sort id
+
+# 输出应力、势能、动能、总能
+fix             f_out all ave/time 1 100 1000 v_stress_GPa v_out_pe v_out_ke v_out_etotal file edge_stress_energy.txt
+
+thermo          1000
+thermo_style    custom step temp pe v_stress_GPa lx
+thermo_modify   lost ignore
+
+# ----------------- 7. 执行拉伸 -----------------
+# 200,000 步 = 50 ps, 位移 10.0 A
+run             400000
+
+print           "=== 模拟成功完成！请查看 edge_stress_energy.txt ==="
